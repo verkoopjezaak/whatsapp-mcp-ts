@@ -3,12 +3,13 @@ import { initializeDatabase } from "./database.ts";
 import { startWhatsAppConnection, type WhatsAppSocket } from "./whatsapp.ts";
 import { startMcpServer } from "./mcp.ts";
 
+const dataDir = process.env.WHATSAPP_MCP_DATA_DIR || '.';
 const waLogger = pino(
   {
     level: process.env.LOG_LEVEL || "info",
     timestamp: pino.stdTimeFunctions.isoTime,
   },
-  pino.destination("./wa-logs.txt")
+  pino.destination(`${dataDir}/wa-logs.txt`)
 );
 
 const mcpLogger = pino(
@@ -16,7 +17,7 @@ const mcpLogger = pino(
     level: process.env.LOG_LEVEL || "info",
     timestamp: pino.stdTimeFunctions.isoTime,
   },
-  pino.destination("./mcp-logs.txt")
+  pino.destination(`${dataDir}/mcp-logs.txt`)
 );
 
 async function main() {

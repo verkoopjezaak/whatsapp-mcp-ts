@@ -142,7 +142,7 @@ export async function startWhatsAppConnection(
         }
       } else if (connection === "open") {
         logger.info(`Connection opened. WA user: ${sock.user?.name}`);
-        console.log("Logged as", sock.user?.name);
+        // console.log("Logged as", sock.user?.name);
       }
     }
 
