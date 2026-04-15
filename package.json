@@ -3,6 +3,12 @@
   "version": "1.0.0",
   "main": "src/main.ts",
   "type": "module",
+  "scripts": {
+    "all": "node --experimental-strip-types src/main.ts",
+    "daemon": "node --experimental-strip-types src/daemon.ts",
+    "mcp": "node --experimental-strip-types src/mcp-server.ts",
+    "start": "node --experimental-strip-types src/main.ts"
+  },
   "keywords": [],
   "author": "jlucaso",
   "license": "ISC",

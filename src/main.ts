@@ -1,9 +1,9 @@
 import { pino } from "pino";
-import { initializeDatabase } from "./database.ts";
-import { startWhatsAppConnection, type WhatsAppSocket } from "./whatsapp.ts";
-import { startMcpServer } from "./mcp.ts";
+import { startDaemon } from "./daemon.ts";
+import { runMcpServer } from "./mcp-server.ts";
 
-const dataDir = process.env.WHATSAPP_MCP_DATA_DIR || '.';
+const dataDir = process.env.WHATSAPP_MCP_DATA_DIR || ".";
+
 const waLogger = pino(
   {
     level: process.env.LOG_LEVEL || "info",
@@ -20,38 +20,40 @@ const mcpLogger = pino(
   pino.destination(`${dataDir}/mcp-logs.txt`)
 );
 
-async function main() {
-  mcpLogger.info("Starting WhatsApp MCP Server...");
+const daemonLogger = pino(
+  {
+    level: process.env.LOG_LEVEL || "info",
+    timestamp: pino.stdTimeFunctions.isoTime,
+  },
+  pino.destination(`${dataDir}/daemon-logs.txt`)
+);
 
-  let whatsappSocket: WhatsAppSocket | null = null;
+/**
+ * Combined entry point: boots the WhatsApp daemon AND the MCP server in a
+ * single process. Keeps backwards-compatible behaviour with the pre-split
+ * main.ts. Later phases may run daemon and MCP server as separate processes;
+ * this file remains the "run everything together" convenience entry.
+ */
+async function main() {
+  mcpLogger.info("Starting WhatsApp MCP Server (combined mode)...");
 
   try {
-    mcpLogger.info("Initializing database...");
-    initializeDatabase();
-    mcpLogger.info("Database initialized successfully.");
-
-    mcpLogger.info("Attempting to connect to WhatsApp...");
-    whatsappSocket = await startWhatsAppConnection(waLogger);
-    mcpLogger.info("WhatsApp connection process initiated.");
+    const { whatsappSocket } = await startDaemon({
+      waLogger,
+      daemonLogger,
+    });
+    await runMcpServer({ whatsappSocket, mcpLogger, waLogger });
+    mcpLogger.info("Application setup complete. Running...");
   } catch (error: any) {
     mcpLogger.fatal(
       { err: error },
-      "Failed during initialization or WhatsApp connection attempt"
+      "Failed during initialization or startup"
     );
-
+    waLogger.flush();
+    mcpLogger.flush();
+    daemonLogger.flush();
     process.exit(1);
   }
-
-  try {
-    mcpLogger.info("Starting MCP server...");
-    await startMcpServer(whatsappSocket, mcpLogger, waLogger);
-    mcpLogger.info("MCP Server started and listening.");
-  } catch (error: any) {
-    mcpLogger.fatal({ err: error }, "Failed to start MCP server");
-    process.exit(1);
-  }
-
-  mcpLogger.info("Application setup complete. Running...");
 }
 
 async function shutdown(signal: string) {
@@ -59,6 +61,7 @@ async function shutdown(signal: string) {
 
   waLogger.flush();
   mcpLogger.flush();
+  daemonLogger.flush();
 
   process.exit(0);
 }
@@ -70,5 +73,6 @@ main().catch((error) => {
   mcpLogger.fatal({ err: error }, "Unhandled error during application startup");
   waLogger.flush();
   mcpLogger.flush();
+  daemonLogger.flush();
   process.exit(1);
 });
