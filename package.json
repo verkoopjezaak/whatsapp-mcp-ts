@@ -18,12 +18,14 @@
     "@whiskeysockets/baileys": "^6.7.16",
     "open": "^10.1.0",
     "openai": "^6.34.0",
+    "pdf-parse": "^2.4.5",
     "pino": "^9.6.0",
     "qrcode-terminal": "^0.12.0",
     "zod": "^3.24.2"
   },
   "devDependencies": {
     "@types/node": "^22.13.14",
+    "@types/pdf-parse": "^1.1.5",
     "@types/pino": "^7.0.5",
     "typescript": "^5.8.2"
   },
