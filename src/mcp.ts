@@ -22,6 +22,7 @@ import {
 import { sendWhatsAppMessage, AUDIO_DIR, IMAGE_DIR, type WhatsAppSocket } from "./whatsapp.ts";
 import { transcribeAudio } from "./transcribe.ts";
 import { describeImage } from "./describe.ts";
+import { readChatPdf } from "./read-pdf.ts";
 import { type P } from "pino";
 
 function formatDbMessageForJson(msg: DbMessage) {
@@ -846,6 +847,130 @@ export async function startMcpServer(
             {
               type: "text",
               text: `Error describing images in chat ${chat_jid}: ${error.message}`,
+            },
+          ],
+        };
+      }
+    },
+  );
+
+  server.tool(
+    "read_chat_pdfs",
+    {
+      chat_jid: z
+        .string()
+        .describe(
+          "The JID of the chat to read PDF messages from (e.g., '31612345678@s.whatsapp.net')",
+        ),
+      message_id: z
+        .string()
+        .optional()
+        .describe(
+          "Optional specific message_id to read. If omitted, all undprocessed PDFs in the chat are read (up to limit).",
+        ),
+      limit: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe(
+          "Max number of PDFs to read in one call (default 5, kostenbeheersing)",
+        ),
+    },
+    async ({ chat_jid, message_id, limit }) => {
+      mcpLogger.info(
+        `[MCP Tool] Executing read_chat_pdfs for ${chat_jid}${message_id ? ` msg=${message_id}` : ""}`,
+      );
+      try {
+        const allMessages = getMessages(chat_jid, 10000, 0);
+        let pdfMessages = allMessages.filter((m) =>
+          m.content.startsWith("[PDF]"),
+        );
+
+        // Skip ones that already have extracted text in content
+        pdfMessages = pdfMessages.filter(
+          (m) => !m.content.includes("[PDF text:"),
+        );
+
+        if (message_id) {
+          pdfMessages = pdfMessages.filter((m) => m.id === message_id);
+        }
+
+        const cap = limit ?? 5;
+        pdfMessages = pdfMessages.slice(0, cap);
+
+        if (pdfMessages.length === 0) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    chat_jid,
+                    total_pdfs: 0,
+                    read: 0,
+                    details: [],
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          };
+        }
+
+        const results = [];
+        let readOk = 0;
+        let failed = 0;
+        for (const m of pdfMessages) {
+          const result = await readChatPdf(m.id, mcpLogger);
+          if (result.status === "read") {
+            readOk++;
+            results.push({
+              id: m.id,
+              filename: m.content.replace(/^\[PDF\]\s*/, "").split(" — ")[0],
+              pages: result.pages,
+              truncated: result.truncated,
+              text: result.text,
+            });
+          } else {
+            failed++;
+            results.push({
+              id: m.id,
+              status: result.status,
+              error: result.error,
+            });
+          }
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  chat_jid,
+                  total_pdfs: pdfMessages.length,
+                  read: readOk,
+                  failed,
+                  details: results,
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      } catch (error: any) {
+        mcpLogger.error(
+          `[MCP Tool Error] read_chat_pdfs failed for ${chat_jid}: ${error.message}`,
+        );
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: `Error reading PDFs in chat ${chat_jid}: ${error.message}`,
             },
           ],
         };

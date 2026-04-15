@@ -47,12 +47,14 @@ function parseMessageForDb(msg: WAMessage): DbMessage | null {
     content = cap ? `[Image] ${cap}` : `[Image]`;
   } else if (msg.message.videoMessage?.caption) {
     content = `[Video] ${msg.message.videoMessage.caption}`;
-  } else if (msg.message.documentMessage?.caption) {
-    content = `[Document] ${
-      msg.message.documentMessage.caption ||
-      msg.message.documentMessage.fileName ||
-      ""
-    }`;
+  } else if (msg.message.documentMessage || msg.message.documentWithCaptionMessage?.message?.documentMessage) {
+    const doc =
+      msg.message.documentMessage ||
+      msg.message.documentWithCaptionMessage?.message?.documentMessage!;
+    const fileName = doc.fileName || "document";
+    const caption = doc.caption || msg.message.documentWithCaptionMessage?.message?.documentMessage?.caption;
+    const prefix = doc.mimetype === "application/pdf" ? "[PDF]" : "[Document]";
+    content = caption ? `${prefix} ${fileName} — ${caption}` : `${prefix} ${fileName}`;
   } else if (msg.message.audioMessage) {
     content = `[Audio]`;
   } else if (msg.message.stickerMessage) {
@@ -114,6 +116,12 @@ export const IMAGE_DIR = path.join(
   "images",
 );
 
+export const DOCUMENT_DIR = path.join(
+  process.env.WHATSAPP_MCP_DATA_DIR || import.meta.dirname,
+  "data",
+  "documents",
+);
+
 // Ensure audio directory exists
 if (!fs.existsSync(AUDIO_DIR)) {
   fs.mkdirSync(AUDIO_DIR, { recursive: true });
@@ -122,6 +130,11 @@ if (!fs.existsSync(AUDIO_DIR)) {
 // Ensure image directory exists
 if (!fs.existsSync(IMAGE_DIR)) {
   fs.mkdirSync(IMAGE_DIR, { recursive: true });
+}
+
+// Ensure document directory exists
+if (!fs.existsSync(DOCUMENT_DIR)) {
+  fs.mkdirSync(DOCUMENT_DIR, { recursive: true });
 }
 
 async function saveImageToDisk(
@@ -161,6 +174,53 @@ async function saveImageToDisk(
     }
   }
   return false;
+}
+
+async function saveDocumentToDisk(
+  msg: WAMessage,
+  messageId: string,
+  sock: WhatsAppSocket,
+  logger: P.Logger,
+): Promise<{ path: string; mimetype: string | null; fileName: string | null } | null> {
+  const doc =
+    msg.message?.documentMessage ||
+    msg.message?.documentWithCaptionMessage?.message?.documentMessage;
+  if (!doc) return null;
+
+  const ext = doc.mimetype === "application/pdf" ? "pdf" : "bin";
+  const docPath = path.join(DOCUMENT_DIR, `${messageId}.${ext}`);
+  if (fs.existsSync(docPath)) {
+    return { path: docPath, mimetype: doc.mimetype ?? null, fileName: doc.fileName ?? null };
+  }
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const buffer = await downloadMediaMessage(
+        msg,
+        "buffer",
+        {},
+        (attempt === 0
+          ? { reuploadRequest: sock.updateMediaMessage, logger }
+          : { logger }) as any,
+      );
+
+      if (!buffer || (buffer as Buffer).length === 0) {
+        logger.warn(`Empty document buffer for message ${messageId}`);
+        return null;
+      }
+
+      fs.writeFileSync(docPath, buffer as Buffer);
+      logger.info(
+        `Saved document ${messageId} (${(buffer as Buffer).length} bytes, ${doc.mimetype || "unknown"})`,
+      );
+      return { path: docPath, mimetype: doc.mimetype ?? null, fileName: doc.fileName ?? null };
+    } catch (error: any) {
+      if (attempt === 0) continue;
+      logger.warn(`Failed to download document ${messageId}: ${error.message}`);
+      return null;
+    }
+  }
+  return null;
 }
 
 async function saveAudioToDisk(
@@ -480,6 +540,18 @@ export async function startWhatsAppConnection(
             ) {
               saveImageToDisk(msg, parsed.id, sock, logger).catch((err) =>
                 logger.error(`Image save failed: ${err.message}`),
+              );
+            }
+
+            // Real-time document: save to disk (read on-demand via MCP tool)
+            if (
+              (parsed.content.startsWith("[PDF]") ||
+                parsed.content.startsWith("[Document]")) &&
+              (msg.message?.documentMessage ||
+                msg.message?.documentWithCaptionMessage)
+            ) {
+              saveDocumentToDisk(msg, parsed.id, sock, logger).catch((err) =>
+                logger.error(`Document save failed: ${err.message}`),
               );
             }
           } else {
