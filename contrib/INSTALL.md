@@ -9,6 +9,12 @@ Vanaf Fase 4 draait de Baileys-verbinding als user systemd-service, niet meer al
 mkdir -p ~/.config/systemd/user
 cp contrib/whatsapp-daemon.service ~/.config/systemd/user/
 
+# 1b. Maak .env file voor secrets (nodig voor transcribe + describe)
+cat > /home/umbrel/mcp-servers/whatsapp-mcp-ts/.env <<EOF
+OPENAI_API_KEY=sk-proj-...
+EOF
+chmod 600 /home/umbrel/mcp-servers/whatsapp-mcp-ts/.env
+
 # 2. Maak log-directory
 mkdir -p ~/.local/share/whatsapp-daemon
 
