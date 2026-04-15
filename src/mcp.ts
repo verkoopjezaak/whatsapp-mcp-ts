@@ -16,6 +16,7 @@ import {
   searchDbForContacts,
   searchMessages,
   updateMessageContent,
+  enqueueOutgoingMessage,
 } from "./database.ts";
 
 import { sendWhatsAppMessage, AUDIO_DIR, IMAGE_DIR, type WhatsAppSocket } from "./whatsapp.ts";
@@ -409,17 +410,6 @@ export async function startMcpServer(
     },
     async ({ recipient, message }) => {
       mcpLogger.info(`[MCP Tool] Executing send_message to ${recipient}`);
-      if (!sock) {
-        mcpLogger.error(
-          "[MCP Tool Error] send_message failed: WhatsApp socket is not available.",
-        );
-        return {
-          isError: true,
-          content: [
-            { type: "text", text: "Error: WhatsApp connection is not active." },
-          ],
-        };
-      }
 
       let normalizedRecipient: string;
       try {
@@ -438,6 +428,55 @@ export async function startMcpServer(
               type: "text",
               text: `Invalid recipient format: "${recipient}". Please provide a valid JID (e.g., number@s.whatsapp.net or group@g.us).`,
             },
+          ],
+        };
+      }
+
+      // USE_QUEUE=1: persist in outgoing_messages queue zodat de daemon het
+      // asynchroon verstuurt. Nodig voor split architectuur waarbij MCP-server
+      // geen directe socket heeft.
+      if (process.env.USE_QUEUE === "1") {
+        try {
+          const queueId = enqueueOutgoingMessage({
+            recipient_jid: normalizedRecipient,
+            content: message,
+            queued_by: "mcp-server",
+          });
+          mcpLogger.info(
+            `[MCP Tool] send_message queued (id=${queueId}) for ${normalizedRecipient}`,
+          );
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Message queued for delivery to ${normalizedRecipient} (queue id: ${queueId}). Daemon will deliver asynchronously.`,
+              },
+            ],
+          };
+        } catch (error: any) {
+          mcpLogger.error(
+            `[MCP Tool Error] send_message queue write failed: ${error.message}`,
+          );
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text",
+                text: `Error queuing message: ${error.message}`,
+              },
+            ],
+          };
+        }
+      }
+
+      if (!sock) {
+        mcpLogger.error(
+          "[MCP Tool Error] send_message failed: WhatsApp socket is not available.",
+        );
+        return {
+          isError: true,
+          content: [
+            { type: "text", text: "Error: WhatsApp connection is not active." },
           ],
         };
       }
