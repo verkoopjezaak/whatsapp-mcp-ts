@@ -1,6 +1,7 @@
 import { pino, type Logger } from "pino";
 import { initializeDatabase } from "./database.ts";
 import { startWhatsAppConnection, type WhatsAppSocket } from "./whatsapp.ts";
+import { startQueueProcessor } from "./queue-processor.ts";
 
 const dataDir = process.env.WHATSAPP_MCP_DATA_DIR || ".";
 
@@ -41,6 +42,11 @@ export async function startDaemon(options?: {
   daemonLogger.info("Attempting to connect to WhatsApp...");
   const whatsappSocket = await startWhatsAppConnection(waLogger);
   daemonLogger.info("WhatsApp connection process initiated.");
+
+  // Start queue processor: leest pending outgoing_messages en verstuurt via
+  // de WhatsApp socket. Nodig zodra MCP-server USE_QUEUE=1 gebruikt (fase 4).
+  // Altijd aan zodat queue ook werkt als legacy main.ts wrapper nog draait.
+  startQueueProcessor({ sock: whatsappSocket, logger: waLogger });
 
   return { whatsappSocket, waLogger, daemonLogger };
 }
