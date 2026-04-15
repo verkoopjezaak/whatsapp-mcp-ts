@@ -3,6 +3,7 @@ import {
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
+  downloadMediaMessage,
   DisconnectReason,
   type WAMessage,
   type proto,
@@ -11,15 +12,18 @@ import {
 } from "@whiskeysockets/baileys";
 import P from "pino";
 import path from "node:path";
-import open from "open";
+import fs from "node:fs";
+import qrcode from "qrcode-terminal";
 
 import {
   initializeDatabase,
   storeMessage,
   storeChat,
   storeContact,
+  updateMessageContent,
   type Message as DbMessage,
 } from "./database.ts";
+import { transcribeAudio } from "./transcribe.ts";
 
 const AUTH_DIR = path.join(import.meta.dirname, "..", "auth_info");
 
@@ -37,8 +41,9 @@ function parseMessageForDb(msg: WAMessage): DbMessage | null {
     content = msg.message.conversation;
   } else if (msg.message.extendedTextMessage?.text) {
     content = msg.message.extendedTextMessage.text;
-  } else if (msg.message.imageMessage?.caption) {
-    content = `[Image] ${msg.message.imageMessage.caption}`;
+  } else if (msg.message.imageMessage) {
+    const cap = msg.message.imageMessage.caption;
+    content = cap ? `[Image] ${cap}` : `[Image]`;
   } else if (msg.message.videoMessage?.caption) {
     content = `[Video] ${msg.message.videoMessage.caption}`;
   } else if (msg.message.documentMessage?.caption) {
@@ -94,6 +99,205 @@ function parseMessageForDb(msg: WAMessage): DbMessage | null {
   };
 }
 
+// --- Audio save & transcription ---
+
+export const AUDIO_DIR = path.join(
+  process.env.WHATSAPP_MCP_DATA_DIR || import.meta.dirname,
+  "data",
+  "audio",
+);
+
+export const IMAGE_DIR = path.join(
+  process.env.WHATSAPP_MCP_DATA_DIR || import.meta.dirname,
+  "data",
+  "images",
+);
+
+// Ensure audio directory exists
+if (!fs.existsSync(AUDIO_DIR)) {
+  fs.mkdirSync(AUDIO_DIR, { recursive: true });
+}
+
+// Ensure image directory exists
+if (!fs.existsSync(IMAGE_DIR)) {
+  fs.mkdirSync(IMAGE_DIR, { recursive: true });
+}
+
+async function saveImageToDisk(
+  msg: WAMessage,
+  messageId: string,
+  sock: WhatsAppSocket,
+  logger: P.Logger,
+): Promise<boolean> {
+  const imagePath = path.join(IMAGE_DIR, `${messageId}.jpg`);
+  if (fs.existsSync(imagePath)) return true;
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const buffer = await downloadMediaMessage(
+        msg,
+        "buffer",
+        {},
+        attempt === 0
+          ? { reuploadRequest: sock.updateMediaMessage, logger }
+          : { logger },
+      );
+
+      if (!buffer || (buffer as Buffer).length === 0) {
+        logger.warn(`Empty image buffer for message ${messageId}`);
+        return false;
+      }
+
+      fs.writeFileSync(imagePath, buffer as Buffer);
+      logger.info(
+        `Saved image ${messageId} (${(buffer as Buffer).length} bytes)`,
+      );
+      return true;
+    } catch (error: any) {
+      if (attempt === 0) continue;
+      logger.warn(`Failed to download image ${messageId}: ${error.message}`);
+      return false;
+    }
+  }
+  return false;
+}
+
+async function saveAudioToDisk(
+  msg: WAMessage,
+  messageId: string,
+  sock: WhatsAppSocket,
+  logger: P.Logger,
+): Promise<boolean> {
+  const audioPath = path.join(AUDIO_DIR, `${messageId}.ogg`);
+  if (fs.existsSync(audioPath)) return true;
+
+  // Try download, then retry once without reuploadRequest on failure
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const buffer = await downloadMediaMessage(
+        msg,
+        "buffer",
+        {},
+        attempt === 0
+          ? { reuploadRequest: sock.updateMediaMessage, logger }
+          : { logger },
+      );
+
+      if (!buffer || (buffer as Buffer).length === 0) {
+        logger.warn(`Empty audio buffer for message ${messageId}`);
+        return false;
+      }
+
+      fs.writeFileSync(audioPath, buffer as Buffer);
+      logger.info(
+        `Saved audio ${messageId} (${(buffer as Buffer).length} bytes)`,
+      );
+      return true;
+    } catch (error: any) {
+      if (attempt === 0) continue;
+      logger.warn(`Failed to download audio ${messageId}: ${error.message}`);
+      return false;
+    }
+  }
+  return false;
+}
+
+async function downloadAndTranscribe(
+  msg: WAMessage,
+  messageId: string,
+  chatJid: string,
+  sock: WhatsAppSocket,
+  logger: P.Logger,
+) {
+  const saved = await saveAudioToDisk(msg, messageId, sock, logger);
+  if (!saved) return;
+
+  try {
+    const audioPath = path.join(AUDIO_DIR, `${messageId}.ogg`);
+    const buffer = fs.readFileSync(audioPath);
+    const transcription = await transcribeAudio(buffer, logger);
+
+    if (transcription) {
+      updateMessageContent(messageId, chatJid, `[Audio] ${transcription}`);
+      logger.info(
+        `Transcribed ${messageId}: "${transcription.substring(0, 80)}..."`,
+      );
+    }
+  } catch (error: any) {
+    logger.error(`Failed to transcribe ${messageId}: ${error.message}`);
+  }
+}
+
+// Sequential batch processor for audio downloads during history sync
+const audioBatchQueue: { msg: WAMessage; id: string }[] = [];
+let isBatchProcessing = false;
+
+function saveAudioBatch(
+  items: { msg: WAMessage; id: string }[],
+  sock: WhatsAppSocket,
+  logger: P.Logger,
+) {
+  audioBatchQueue.push(...items);
+  if (!isBatchProcessing) {
+    isBatchProcessing = true;
+    processAudioBatch(sock, logger);
+  }
+}
+
+async function processAudioBatch(sock: WhatsAppSocket, logger: P.Logger) {
+  let saved = 0;
+  let failed = 0;
+  const total = audioBatchQueue.length;
+
+  while (audioBatchQueue.length > 0) {
+    const item = audioBatchQueue.shift()!;
+    const ok = await saveAudioToDisk(item.msg, item.id, sock, logger);
+    if (ok) saved++;
+    else failed++;
+  }
+
+  logger.info(
+    `Audio batch done: ${saved} saved, ${failed} failed out of ${total}`,
+  );
+  isBatchProcessing = false;
+}
+
+// Sequential batch processor for image downloads during history sync
+const imageBatchQueue: { msg: WAMessage; id: string }[] = [];
+let isImageBatchProcessing = false;
+
+function saveImageBatch(
+  items: { msg: WAMessage; id: string }[],
+  sock: WhatsAppSocket,
+  logger: P.Logger,
+) {
+  imageBatchQueue.push(...items);
+  if (!isImageBatchProcessing) {
+    isImageBatchProcessing = true;
+    processImageBatch(sock, logger);
+  }
+}
+
+async function processImageBatch(sock: WhatsAppSocket, logger: P.Logger) {
+  let saved = 0;
+  let failed = 0;
+  const total = imageBatchQueue.length;
+
+  while (imageBatchQueue.length > 0) {
+    const item = imageBatchQueue.shift()!;
+    const ok = await saveImageToDisk(item.msg, item.id, sock, logger);
+    if (ok) saved++;
+    else failed++;
+  }
+
+  logger.info(
+    `Image batch done: ${saved} saved, ${failed} failed out of ${total}`,
+  );
+  isImageBatchProcessing = false;
+}
+
+// --- End audio save & transcription ---
+
 export async function startWhatsAppConnection(
   logger: P.Logger
 ): Promise<WhatsAppSocket> {
@@ -111,7 +315,9 @@ export async function startWhatsAppConnection(
       keys: makeCacheableSignalKeyStore(state.keys, logger),
     },
     generateHighQualityLinkPreview: true,
-    shouldIgnoreJid: (jid) => isJidGroup(jid),
+    syncFullHistory: true,
+    // Include group chats so client group messages are also captured
+    shouldIgnoreJid: () => false,
   });
 
   sock.ev.process(async (events) => {
@@ -120,12 +326,17 @@ export async function startWhatsAppConnection(
       const { connection, lastDisconnect, qr } = update;
 
       if (qr) {
-        logger.info(
-          { qrCodeData: qr },
-          "QR Code Received. Copy the qrCodeData string and use a QR code generator (e.g., online website) to display and scan it with your WhatsApp app."
-        );
-        // for now we roughly open the QR code in a browser
-        await open(`https://quickchart.io/qr?text=${encodeURIComponent(qr)}`);
+        logger.info("QR Code received. Scan with WhatsApp > Linked Devices.");
+        const qrFilePath = path.join(process.env.WHATSAPP_MCP_DATA_DIR || ".", "qr-code.txt");
+        qrcode.generate(qr, { small: true }, (code: string) => {
+          // Write QR to stderr so it doesn't interfere with MCP stdio
+          process.stderr.write("\n=== Scan this QR code with WhatsApp ===\n");
+          process.stderr.write(code);
+          process.stderr.write("\n=======================================\n");
+          // Also save to file for easy access
+          fs.writeFileSync(qrFilePath, `=== Scan this QR code with WhatsApp ===\n${code}\n=======================================\n`);
+          logger.info(`QR code saved to ${qrFilePath}`);
+        });
       }
 
       if (connection === "close") {
@@ -136,14 +347,19 @@ export async function startWhatsAppConnection(
           }`,
           lastDisconnect?.error
         );
-        if (statusCode !== DisconnectReason.loggedOut) {
-          logger.info("Reconnecting...");
-          startWhatsAppConnection(logger);
-        } else {
+        if (statusCode === DisconnectReason.loggedOut) {
           logger.error(
             "Connection closed: Logged Out. Please delete auth_info and restart."
           );
           process.exit(1);
+        } else if (statusCode === DisconnectReason.connectionReplaced) {
+          logger.error(
+            "Connection replaced by another session. Exiting to avoid orphan MCP processes."
+          );
+          process.exit(1);
+        } else {
+          logger.info("Reconnecting...");
+          startWhatsAppConnection(logger);
         }
       } else if (connection === "open") {
         logger.info(`Connection opened. WA user: ${sock.user?.name}`);
@@ -184,14 +400,41 @@ export async function startWhatsAppConnection(
       );
 
       let storedCount = 0;
+      const audioMessages: { msg: WAMessage; id: string }[] = [];
+      const imageMessages: { msg: WAMessage; id: string }[] = [];
       messages.forEach((msg) => {
         const parsed = parseMessageForDb(msg);
         if (parsed) {
           storeMessage(parsed);
           storedCount++;
+          if (parsed.content === "[Audio]" && msg.message?.audioMessage) {
+            audioMessages.push({ msg, id: parsed.id });
+          }
+          if (
+            parsed.content.startsWith("[Image]") &&
+            msg.message?.imageMessage
+          ) {
+            imageMessages.push({ msg, id: parsed.id });
+          }
         }
       });
       logger.info(`Stored ${storedCount} messages from history sync.`);
+
+      // Save audio files to disk sequentially (no transcription, on-demand only)
+      if (audioMessages.length > 0) {
+        logger.info(
+          `Saving ${audioMessages.length} audio files to disk from history sync`,
+        );
+        saveAudioBatch(audioMessages, sock, logger);
+      }
+
+      // Save image files to disk sequentially (no description, on-demand only)
+      if (imageMessages.length > 0) {
+        logger.info(
+          `Saving ${imageMessages.length} image files to disk from history sync`,
+        );
+        saveImageBatch(imageMessages, sock, logger);
+      }
     }
 
     if (events["messages.upsert"]) {
@@ -212,13 +455,36 @@ export async function startWhatsAppConnection(
                 fromMe: parsed.is_from_me,
                 sender: parsed.sender,
               },
-              `Storing message: ${parsed.content.substring(0, 50)}...`
+              `Storing message: ${parsed.content.substring(0, 50)}...`,
             );
             storeMessage(parsed);
+
+            // Real-time audio: save to disk + transcribe immediately
+            if (parsed.content === "[Audio]" && msg.message?.audioMessage) {
+              downloadAndTranscribe(
+                msg,
+                parsed.id,
+                parsed.chat_jid,
+                sock,
+                logger,
+              ).catch((err) =>
+                logger.error(`Audio processing failed: ${err.message}`),
+              );
+            }
+
+            // Real-time image: save to disk only (describe on-demand via MCP tool)
+            if (
+              parsed.content.startsWith("[Image]") &&
+              msg.message?.imageMessage
+            ) {
+              saveImageToDisk(msg, parsed.id, sock, logger).catch((err) =>
+                logger.error(`Image save failed: ${err.message}`),
+              );
+            }
           } else {
             logger.warn(
               { msgId: msg.key?.id, chatId: msg.key?.remoteJid },
-              "Skipped storing message (parsing failed or unsupported type)"
+              "Skipped storing message (parsing failed or unsupported type)",
             );
           }
         }

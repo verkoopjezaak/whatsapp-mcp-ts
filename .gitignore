@@ -22,3 +22,5 @@ data/
 .DS_Store
 Thumbs.db
 .roo
+# QR code output tijdens eerste login
+qr-code.txt
