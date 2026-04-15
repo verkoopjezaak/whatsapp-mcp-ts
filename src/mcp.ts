@@ -64,15 +64,20 @@ export async function startMcpServer(
 ): Promise<void> {
   mcpLogger.info("Initializing MCP server...");
 
-  const server = new McpServer({
-    name: "whatsapp-baileys-ts",
-    version: "0.1.0",
-    capabilities: {
-      tools: {},
-      resources: {},
+  const server = new McpServer(
+    {
+      name: "whatsapp-baileys-ts",
+      version: "0.1.0",
     },
-  });
+    {
+      capabilities: {
+        tools: {},
+        resources: {},
+      },
+    },
+  );
 
+  // @ts-expect-error — zod schema inference triggers TS2589 "excessively deep"; runtime is correct
   server.tool(
     "search_contacts",
     {
@@ -187,6 +192,7 @@ export async function startMcpServer(
     },
   );
 
+  // @ts-expect-error — zod schema inference triggers TS2589 "excessively deep"; runtime is correct
   server.tool(
     "list_chats",
     {
@@ -662,6 +668,7 @@ export async function startMcpServer(
     },
   );
 
+  // @ts-expect-error — zod schema inference triggers TS2589 "excessively deep"; runtime is correct
   server.tool(
     "describe_chat_images",
     {

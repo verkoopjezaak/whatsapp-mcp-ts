@@ -13,6 +13,7 @@ import {
 import P from "pino";
 import path from "node:path";
 import fs from "node:fs";
+// @ts-ignore — qrcode-terminal heeft geen types
 import qrcode from "qrcode-terminal";
 
 import {
@@ -138,9 +139,9 @@ async function saveImageToDisk(
         msg,
         "buffer",
         {},
-        attempt === 0
+        (attempt === 0
           ? { reuploadRequest: sock.updateMediaMessage, logger }
-          : { logger },
+          : { logger }) as any,
       );
 
       if (!buffer || (buffer as Buffer).length === 0) {
@@ -178,9 +179,9 @@ async function saveAudioToDisk(
         msg,
         "buffer",
         {},
-        attempt === 0
+        (attempt === 0
           ? { reuploadRequest: sock.updateMediaMessage, logger }
-          : { logger },
+          : { logger }) as any,
       );
 
       if (!buffer || (buffer as Buffer).length === 0) {
