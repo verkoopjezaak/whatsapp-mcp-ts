@@ -424,6 +424,22 @@ export function searchMessages(
   }
 }
 
+export function updateMessageContent(
+  id: string,
+  chatJid: string,
+  content: string,
+): void {
+  const db = getDb();
+  try {
+    const stmt = db.prepare(
+      `UPDATE messages SET content = ? WHERE id = ? AND chat_jid = ?`,
+    );
+    stmt.run(content, id, chatJid);
+  } catch (error) {
+    console.error("Error updating message content:", error);
+  }
+}
+
 export function closeDatabase(): void {
   if (dbInstance) {
     try {

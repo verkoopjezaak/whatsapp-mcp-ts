@@ -3,6 +3,9 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { jidNormalizedUser } from "@whiskeysockets/baileys";
 
+import fs from "node:fs";
+import path from "node:path";
+
 import {
   type Message as DbMessage,
   type Chat as DbChat,
@@ -12,9 +15,12 @@ import {
   getMessagesAround,
   searchDbForContacts,
   searchMessages,
+  updateMessageContent,
 } from "./database.ts";
 
-import { sendWhatsAppMessage, type WhatsAppSocket } from "./whatsapp.ts";
+import { sendWhatsAppMessage, AUDIO_DIR, IMAGE_DIR, type WhatsAppSocket } from "./whatsapp.ts";
+import { transcribeAudio } from "./transcribe.ts";
+import { describeImage } from "./describe.ts";
 import { type P } from "pino";
 
 function formatDbMessageForJson(msg: DbMessage) {
@@ -547,6 +553,253 @@ export async function startMcpServer(
             {
               type: "text",
               text: `Error searching messages in chat ${chat_jid}: ${error.message}`,
+            },
+          ],
+        };
+      }
+    },
+  );
+
+  server.tool(
+    "transcribe_chat",
+    {
+      chat_jid: z
+        .string()
+        .describe(
+          "The JID of the chat to transcribe audio messages for (e.g., '31621516764@s.whatsapp.net')",
+        ),
+    },
+    async ({ chat_jid }) => {
+      mcpLogger.info(
+        `[MCP Tool] Executing transcribe_chat for ${chat_jid}`,
+      );
+      try {
+        // Get all untranscribed audio messages for this chat
+        const allMessages = getMessages(chat_jid, 10000, 0);
+        const audioMessages = allMessages.filter(
+          (m) => m.content === "[Audio]",
+        );
+
+        if (audioMessages.length === 0) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `No untranscribed audio messages found in chat ${chat_jid}.`,
+              },
+            ],
+          };
+        }
+
+        let transcribed = 0;
+        let failed = 0;
+        const results: string[] = [];
+
+        for (const msg of audioMessages) {
+          const audioPath = path.join(AUDIO_DIR, `${msg.id}.ogg`);
+          if (!fs.existsSync(audioPath)) {
+            failed++;
+            results.push(`${msg.id}: no audio file on disk`);
+            continue;
+          }
+
+          try {
+            const buffer = fs.readFileSync(audioPath);
+            const transcription = await transcribeAudio(buffer, mcpLogger);
+
+            if (transcription) {
+              updateMessageContent(
+                msg.id,
+                msg.chat_jid,
+                `[Audio] ${transcription}`,
+              );
+              transcribed++;
+              results.push(
+                `${msg.id}: "${transcription.substring(0, 60)}..."`,
+              );
+            } else {
+              failed++;
+              results.push(`${msg.id}: transcription returned empty`);
+            }
+          } catch (err: any) {
+            failed++;
+            results.push(`${msg.id}: ${err.message}`);
+          }
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  chat_jid,
+                  total_audio: audioMessages.length,
+                  transcribed,
+                  failed,
+                  details: results,
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      } catch (error: any) {
+        mcpLogger.error(
+          `[MCP Tool Error] transcribe_chat failed for ${chat_jid}: ${error.message}`,
+        );
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: `Error transcribing chat ${chat_jid}: ${error.message}`,
+            },
+          ],
+        };
+      }
+    },
+  );
+
+  server.tool(
+    "describe_chat_images",
+    {
+      chat_jid: z
+        .string()
+        .describe(
+          "The JID of the chat to describe image messages for (e.g., '120363424734382777@g.us')",
+        ),
+      message_id: z
+        .string()
+        .optional()
+        .describe(
+          "Optional specific message_id to describe. If omitted, all undescribed images in the chat are processed.",
+        ),
+      limit: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe(
+          "Max number of images to describe in one call (default 20, kostenbeheersing)",
+        ),
+    },
+    async ({ chat_jid, message_id, limit }) => {
+      mcpLogger.info(
+        `[MCP Tool] Executing describe_chat_images for ${chat_jid}${message_id ? ` msg=${message_id}` : ""}`,
+      );
+      try {
+        const allMessages = getMessages(chat_jid, 10000, 0);
+        let imageMessages = allMessages.filter(
+          (m) => m.content === "[Image]" || m.content.startsWith("[Image] "),
+        );
+
+        // Only re-describe when there's no existing description body
+        // "[Image]" (no caption, no description) or "[Image] <caption>" (caption only)
+        // Once described we write "[Image: <description>]" which is excluded below.
+        imageMessages = imageMessages.filter(
+          (m) => !m.content.startsWith("[Image:"),
+        );
+
+        if (message_id) {
+          imageMessages = imageMessages.filter((m) => m.id === message_id);
+        }
+
+        const cap = limit ?? 20;
+        imageMessages = imageMessages.slice(0, cap);
+
+        if (imageMessages.length === 0) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `No undescribed images found in chat ${chat_jid}${message_id ? ` for message ${message_id}` : ""}.`,
+              },
+            ],
+          };
+        }
+
+        let described = 0;
+        let failed = 0;
+        const results: Array<{
+          id: string;
+          status: string;
+          description?: string;
+        }> = [];
+
+        for (const msg of imageMessages) {
+          const imagePath = path.join(IMAGE_DIR, `${msg.id}.jpg`);
+          if (!fs.existsSync(imagePath)) {
+            failed++;
+            results.push({ id: msg.id, status: "no image file on disk" });
+            continue;
+          }
+
+          try {
+            const buffer = fs.readFileSync(imagePath);
+            const caption =
+              msg.content.startsWith("[Image] ") && msg.content.length > 8
+                ? msg.content.substring(8)
+                : null;
+            const description = await describeImage(
+              buffer,
+              caption,
+              mcpLogger,
+            );
+
+            if (description) {
+              const newContent = caption
+                ? `[Image: ${description}] caption: ${caption}`
+                : `[Image: ${description}]`;
+              updateMessageContent(msg.id, msg.chat_jid, newContent);
+              described++;
+              results.push({
+                id: msg.id,
+                status: "described",
+                description: description.substring(0, 200),
+              });
+            } else {
+              failed++;
+              results.push({
+                id: msg.id,
+                status: "description returned empty",
+              });
+            }
+          } catch (err: any) {
+            failed++;
+            results.push({ id: msg.id, status: `error: ${err.message}` });
+          }
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  chat_jid,
+                  total_images: imageMessages.length,
+                  described,
+                  failed,
+                  details: results,
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      } catch (error: any) {
+        mcpLogger.error(
+          `[MCP Tool Error] describe_chat_images failed for ${chat_jid}: ${error.message}`,
+        );
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: `Error describing images in chat ${chat_jid}: ${error.message}`,
             },
           ],
         };
