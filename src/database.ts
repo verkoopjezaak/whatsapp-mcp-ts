@@ -39,7 +39,11 @@ function getDb(): DatabaseSync {
 export function initializeDatabase(): DatabaseSync {
   const db = getDb();
 
+  // Concurrency tuning: WAL + busy_timeout zodat daemon writes en MCP-server
+  // reads elkaar niet blokkeren bij parallelle Claude sessies.
   db.exec("PRAGMA journal_mode = WAL");
+  db.exec("PRAGMA synchronous = NORMAL");
+  db.exec("PRAGMA busy_timeout = 5000");
 
   db.exec(`
         CREATE TABLE IF NOT EXISTS chats (
@@ -84,7 +88,91 @@ export function initializeDatabase(): DatabaseSync {
     `CREATE INDEX IF NOT EXISTS idx_chats_last_message_time ON chats (last_message_time);`,
   );
 
+  // Outgoing message queue: MCP server schrijft pending entries, daemon
+  // verwerkt ze. Gebruikt door send_message wanneer USE_QUEUE=1.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS outgoing_messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      recipient_jid TEXT NOT NULL,
+      content TEXT NOT NULL,
+      reply_to_message_id TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      error_message TEXT,
+      queued_at TEXT NOT NULL,
+      sent_at TEXT,
+      queued_by TEXT
+    );
+  `);
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_outgoing_status ON outgoing_messages (status, queued_at);`,
+  );
+
   return db;
+}
+
+export interface OutgoingMessage {
+  id: number;
+  recipient_jid: string;
+  content: string;
+  reply_to_message_id: string | null;
+  status: "pending" | "sending" | "sent" | "failed";
+  error_message: string | null;
+  queued_at: string;
+  sent_at: string | null;
+  queued_by: string | null;
+}
+
+export function enqueueOutgoingMessage(params: {
+  recipient_jid: string;
+  content: string;
+  reply_to_message_id?: string | null;
+  queued_by?: string | null;
+}): number {
+  const db = getDb();
+  const stmt = db.prepare(`
+    INSERT INTO outgoing_messages (recipient_jid, content, reply_to_message_id, status, queued_at, queued_by)
+    VALUES (@recipient_jid, @content, @reply_to_message_id, 'pending', @queued_at, @queued_by)
+  `);
+  const result = stmt.run({
+    recipient_jid: params.recipient_jid,
+    content: params.content,
+    reply_to_message_id: params.reply_to_message_id ?? null,
+    queued_at: new Date().toISOString(),
+    queued_by: params.queued_by ?? null,
+  });
+  return Number(result.lastInsertRowid);
+}
+
+export function claimPendingOutgoingMessages(limit: number = 10): OutgoingMessage[] {
+  const db = getDb();
+  // Atomic claim: pending -> sending zodat parallelle processors niet dubbel versturen.
+  const claimStmt = db.prepare(`
+    UPDATE outgoing_messages
+    SET status = 'sending'
+    WHERE id IN (
+      SELECT id FROM outgoing_messages
+      WHERE status = 'pending'
+      ORDER BY queued_at ASC
+      LIMIT ?
+    )
+    RETURNING id, recipient_jid, content, reply_to_message_id, status, error_message, queued_at, sent_at, queued_by
+  `);
+  const rows = claimStmt.all(limit) as any[];
+  return rows as OutgoingMessage[];
+}
+
+export function markOutgoingSent(id: number): void {
+  const db = getDb();
+  db.prepare(
+    `UPDATE outgoing_messages SET status = 'sent', sent_at = ? WHERE id = ?`,
+  ).run(new Date().toISOString(), id);
+}
+
+export function markOutgoingFailed(id: number, errorMessage: string): void {
+  const db = getDb();
+  db.prepare(
+    `UPDATE outgoing_messages SET status = 'failed', error_message = ? WHERE id = ?`,
+  ).run(errorMessage, id);
 }
 
 export function storeChat(chat: Partial<Chat> & { jid: string }): void {
