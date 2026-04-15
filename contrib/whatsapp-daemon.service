@@ -8,7 +8,7 @@ Type=simple
 WorkingDirectory=/home/umbrel/mcp-servers/whatsapp-mcp-ts
 Environment=NODE_ENV=production
 Environment=LOG_LEVEL=info
-ExecStart=/usr/bin/node --experimental-sqlite --experimental-strip-types --no-warnings /home/umbrel/mcp-servers/whatsapp-mcp-ts/src/daemon.ts
+ExecStart=/usr/local/bin/node --experimental-sqlite --experimental-strip-types --no-warnings /home/umbrel/mcp-servers/whatsapp-mcp-ts/src/daemon.ts
 Restart=always
 RestartSec=5
 StandardOutput=append:%h/.local/share/whatsapp-daemon/stdout.log
