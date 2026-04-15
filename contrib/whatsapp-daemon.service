@@ -8,6 +8,8 @@ Type=simple
 WorkingDirectory=/home/umbrel/mcp-servers/whatsapp-mcp-ts
 Environment=NODE_ENV=production
 Environment=LOG_LEVEL=info
+Environment=WHATSAPP_MCP_DATA_DIR=/home/umbrel/mcp-servers/whatsapp-mcp-ts
+EnvironmentFile=-/home/umbrel/mcp-servers/whatsapp-mcp-ts/.env
 ExecStart=/usr/local/bin/node --experimental-sqlite --experimental-strip-types --no-warnings /home/umbrel/mcp-servers/whatsapp-mcp-ts/src/daemon.ts
 Restart=always
 RestartSec=5
