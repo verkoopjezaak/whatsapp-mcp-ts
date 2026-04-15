@@ -34,23 +34,43 @@ export async function runMcpServer(params: {
 /**
  * Entry point when this file is executed directly (e.g. `npm run mcp`).
  *
- * In Phase 1 the MCP server still needs a live WhatsApp socket in the same
- * process, so we bootstrap the daemon in-process. In later phases this will
- * be replaced by an IPC/DB connection to a separately-running daemon.
+ * Modes:
+ * - **Default (WHATSAPP_MCP_NO_DAEMON unset)**: legacy behaviour — bootstrap
+ *   daemon in-process, MCP server krijgt live socket. Gebruikt door main.ts
+ *   wrapper (backwards compat).
+ * - **WHATSAPP_MCP_NO_DAEMON=1**: daemon draait elders (systemd). MCP server
+ *   leest database direct en schrijft send_message naar outgoing_messages
+ *   queue. Vereist USE_QUEUE=1 (wordt automatisch gezet).
  */
 async function runStandalone() {
   const mcpLogger = createLogger("mcp-logs.txt");
   const waLogger = createLogger("wa-logs.txt");
-  const daemonLogger = createLogger("daemon-logs.txt");
+  const noDaemon = process.env.WHATSAPP_MCP_NO_DAEMON === "1";
 
-  mcpLogger.info("Starting MCP server (standalone mode)...");
+  mcpLogger.info(
+    `Starting MCP server (standalone${noDaemon ? ", no-daemon" : ""})...`,
+  );
 
   try {
-    const { whatsappSocket } = await startDaemon({
-      waLogger,
-      daemonLogger,
-    });
-    await runMcpServer({ whatsappSocket, mcpLogger, waLogger });
+    if (noDaemon) {
+      // Database-only mode. Initialiseer de database lokaal (idempotent via
+      // CREATE IF NOT EXISTS) zodat queries werken, maar open geen WhatsApp
+      // socket — dat doet de daemon in een ander process.
+      const { initializeDatabase } = await import("./database.ts");
+      initializeDatabase();
+      process.env.USE_QUEUE = "1";
+      mcpLogger.info(
+        "No-daemon mode: database initialized, USE_QUEUE forced on.",
+      );
+      await runMcpServer({ whatsappSocket: null as any, mcpLogger, waLogger });
+    } else {
+      const daemonLogger = createLogger("daemon-logs.txt");
+      const { whatsappSocket } = await startDaemon({
+        waLogger,
+        daemonLogger,
+      });
+      await runMcpServer({ whatsappSocket, mcpLogger, waLogger });
+    }
     mcpLogger.info("MCP standalone setup complete.");
   } catch (error: any) {
     mcpLogger.fatal(
@@ -64,7 +84,6 @@ async function runStandalone() {
     mcpLogger.info(`Received ${signal}. Shutting down MCP server...`);
     waLogger.flush();
     mcpLogger.flush();
-    daemonLogger.flush();
     process.exit(0);
   }
 
