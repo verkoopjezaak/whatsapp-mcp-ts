@@ -24,3 +24,4 @@ Thumbs.db
 .roo
 # QR code output tijdens eerste login
 qr-code.txt
+daemon-logs.txt

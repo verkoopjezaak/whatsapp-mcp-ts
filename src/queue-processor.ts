@@ -8,6 +8,12 @@ import { sendWhatsAppMessage, type WhatsAppSocket } from "./whatsapp.ts";
 
 const POLL_INTERVAL_MS = Number(process.env.QUEUE_POLL_MS ?? 2000);
 const BATCH_SIZE = Number(process.env.QUEUE_BATCH_SIZE ?? 10);
+const MAX_ATTEMPTS = Number(process.env.QUEUE_MAX_ATTEMPTS ?? 3);
+const RETRY_BACKOFF_MS = Number(process.env.QUEUE_RETRY_BACKOFF_MS ?? 500);
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
 
 /**
  * Periodic processor for the outgoing_messages queue. Claims pending rows
@@ -46,30 +52,49 @@ export function startQueueProcessor(params: {
       );
 
       for (const row of batch) {
-        try {
-          const result = await sendWhatsAppMessage(
-            logger,
-            sock,
-            row.recipient_jid,
-            row.content,
-          );
-          if (result && result.key && result.key.id) {
-            markOutgoingSent(row.id);
-            logger.info(
-              `[queue-processor] sent id=${row.id} to=${row.recipient_jid} waId=${result.key.id}`,
+        let lastError: string | null = null;
+        let sent = false;
+
+        for (let attempt = 1; attempt <= MAX_ATTEMPTS && !sent; attempt++) {
+          try {
+            const result = await sendWhatsAppMessage(
+              logger,
+              sock,
+              row.recipient_jid,
+              row.content,
             );
-          } else {
-            markOutgoingFailed(row.id, "sendMessage returned no key");
+            if (result && result.key && result.key.id) {
+              markOutgoingSent(row.id);
+              logger.info(
+                `[queue-processor] sent id=${row.id} to=${row.recipient_jid} attempt=${attempt} waId=${result.key.id}`,
+              );
+              sent = true;
+            } else {
+              lastError = "sendMessage returned no key";
+              logger.warn(
+                `[queue-processor] attempt ${attempt}/${MAX_ATTEMPTS} failed id=${row.id}: no key`,
+              );
+            }
+          } catch (err: any) {
+            lastError = err?.message ?? String(err);
             logger.warn(
-              `[queue-processor] failed id=${row.id} to=${row.recipient_jid} (no key returned)`,
+              { err },
+              `[queue-processor] attempt ${attempt}/${MAX_ATTEMPTS} error id=${row.id}: ${lastError}`,
             );
           }
-        } catch (err: any) {
-          const msg = err?.message ?? String(err);
-          markOutgoingFailed(row.id, msg);
+
+          if (!sent && attempt < MAX_ATTEMPTS) {
+            await sleep(RETRY_BACKOFF_MS * attempt);
+          }
+        }
+
+        if (!sent) {
+          markOutgoingFailed(
+            row.id,
+            lastError ?? `failed after ${MAX_ATTEMPTS} attempts`,
+          );
           logger.error(
-            { err },
-            `[queue-processor] error id=${row.id} to=${row.recipient_jid}: ${msg}`,
+            `[queue-processor] permanent failure id=${row.id} to=${row.recipient_jid} after ${MAX_ATTEMPTS} attempts: ${lastError}`,
           );
         }
       }
