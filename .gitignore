@@ -25,3 +25,6 @@ Thumbs.db
 # QR code output tijdens eerste login
 qr-code.txt
 daemon-logs.txt
+
+# Scratch / ad-hoc smoke tests (niet commiten)
+src/__scratch/
