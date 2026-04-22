@@ -360,7 +360,8 @@ async function processImageBatch(sock: WhatsAppSocket, logger: P.Logger) {
 // --- End audio save & transcription ---
 
 export async function startWhatsAppConnection(
-  logger: P.Logger
+  logger: P.Logger,
+  onSocket?: (sock: WhatsAppSocket) => void,
 ): Promise<WhatsAppSocket> {
   initializeDatabase();
 
@@ -380,6 +381,12 @@ export async function startWhatsAppConnection(
     // Include group chats so client group messages are also captured
     shouldIgnoreJid: () => false,
   });
+
+  // Notify holder zodat callers (bv. de daemon) altijd de CURRENT socket
+  // kunnen resolven na een reconnect. Zonder dit bindt startQueueProcessor
+  // zich voor eeuwig aan het eerste socket-object en blijft de queue hangen
+  // zodra WhatsApp een restartRequired (code 515) triggert.
+  onSocket?.(sock);
 
   sock.ev.process(async (events) => {
     if (events["connection.update"]) {
@@ -420,7 +427,9 @@ export async function startWhatsAppConnection(
           process.exit(1);
         } else {
           logger.info("Reconnecting...");
-          startWhatsAppConnection(logger);
+          // Geef de onSocket-callback door zodat de nieuwe socket ook
+          // geregistreerd wordt bij de holder (queue-processor).
+          startWhatsAppConnection(logger, onSocket);
         }
       } else if (connection === "open") {
         logger.info(`Connection opened. WA user: ${sock.user?.name}`);
