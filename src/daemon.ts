@@ -1,5 +1,5 @@
 import { pino, type Logger } from "pino";
-import { initializeDatabase } from "./database.ts";
+import { initializeDatabase, closeDatabase } from "./database.ts";
 import { startWhatsAppConnection, type WhatsAppSocket } from "./whatsapp.ts";
 import { startQueueProcessor } from "./queue-processor.ts";
 
@@ -88,8 +88,19 @@ async function runStandalone() {
     process.exit(1);
   }
 
+  let shuttingDown = false;
   function shutdown(signal: string) {
+    if (shuttingDown) return;
+    shuttingDown = true;
     daemonLogger.info(`Received ${signal}. Shutting down daemon...`);
+    // Sluit SQLite netjes: WAL checkpoint + statement finalization. Zonder
+    // dit kan een harde SIGTERM leiden tot -wal/-shm bestanden die bij
+    // volgende start de DB in "locked" staat achterlaten.
+    try {
+      closeDatabase();
+    } catch (err) {
+      daemonLogger.error({ err }, "Error closing database during shutdown");
+    }
     waLogger.flush();
     daemonLogger.flush();
     process.exit(0);
