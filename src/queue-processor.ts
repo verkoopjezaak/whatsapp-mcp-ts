@@ -4,7 +4,11 @@ import {
   markOutgoingSent,
   markOutgoingFailed,
 } from "./database.ts";
-import { sendWhatsAppMessage, type WhatsAppSocket } from "./whatsapp.ts";
+import {
+  sendWhatsAppMessage,
+  WhatsAppSendError,
+  type WhatsAppSocket,
+} from "./whatsapp.ts";
 
 const POLL_INTERVAL_MS = Number(process.env.QUEUE_POLL_MS ?? 2000);
 const BATCH_SIZE = Number(process.env.QUEUE_BATCH_SIZE ?? 10);
@@ -54,6 +58,7 @@ export function startQueueProcessor(params: {
       for (const row of batch) {
         let lastError: string | null = null;
         let sent = false;
+        let permanent = false;
 
         for (let attempt = 1; attempt <= MAX_ATTEMPTS && !sent; attempt++) {
           try {
@@ -63,24 +68,28 @@ export function startQueueProcessor(params: {
               row.recipient_jid,
               row.content,
             );
-            if (result && result.key && result.key.id) {
-              markOutgoingSent(row.id);
-              logger.info(
-                `[queue-processor] sent id=${row.id} to=${row.recipient_jid} attempt=${attempt} waId=${result.key.id}`,
-              );
-              sent = true;
-            } else {
-              lastError = "sendMessage returned no key";
-              logger.warn(
-                `[queue-processor] attempt ${attempt}/${MAX_ATTEMPTS} failed id=${row.id}: no key`,
-              );
-            }
+            markOutgoingSent(row.id);
+            logger.info(
+              `[queue-processor] sent id=${row.id} to=${row.recipient_jid} attempt=${attempt} waId=${result.key.id}`,
+            );
+            sent = true;
           } catch (err: any) {
-            lastError = err?.message ?? String(err);
+            const isPermanent = err instanceof WhatsAppSendError && err.isPermanent;
+            // Bewaar volledige context: statusCode + message + Baileys data code.
+            const parts = [err?.message ?? String(err)];
+            if (err?.statusCode) parts.push(`status=${err.statusCode}`);
+            if (err?.data != null && err.data !== err.statusCode) {
+              parts.push(`data=${err.data}`);
+            }
+            lastError = parts.join(" | ");
             logger.warn(
-              { err },
+              { err, permanent: isPermanent },
               `[queue-processor] attempt ${attempt}/${MAX_ATTEMPTS} error id=${row.id}: ${lastError}`,
             );
+            if (isPermanent) {
+              permanent = true;
+              break; // retry lost niets op bij 406 / logged out
+            }
           }
 
           if (!sent && attempt < MAX_ATTEMPTS) {
@@ -89,12 +98,13 @@ export function startQueueProcessor(params: {
         }
 
         if (!sent) {
-          markOutgoingFailed(
-            row.id,
-            lastError ?? `failed after ${MAX_ATTEMPTS} attempts`,
-          );
+          const finalError = permanent
+            ? `PERMANENT: ${lastError}`
+            : (lastError ?? `failed after ${MAX_ATTEMPTS} attempts`);
+          markOutgoingFailed(row.id, finalError);
           logger.error(
-            `[queue-processor] permanent failure id=${row.id} to=${row.recipient_jid} after ${MAX_ATTEMPTS} attempts: ${lastError}`,
+            { permanent },
+            `[queue-processor] ${permanent ? "permanent" : "retry-exhausted"} failure id=${row.id} to=${row.recipient_jid}: ${finalError}`,
           );
         }
       }

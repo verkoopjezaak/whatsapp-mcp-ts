@@ -593,37 +593,82 @@ export async function startWhatsAppConnection(
   return sock;
 }
 
+/**
+ * Permanente Baileys/WhatsApp errors waarvoor retry geen zin heeft.
+ * Deze moeten NIET stilzwijgend worden opgevreten door sendWhatsAppMessage:
+ * de queue-processor moet ze zien zodat hij retry kan staken en de echte
+ * error kan opslaan in outgoing_messages.error_message.
+ *
+ * - not-acceptable (406): WhatsApp weigert assertSessions voor stale LID
+ *   device-id. Terugsturen veroorzaakt oneindige loops.
+ * - Connection Closed (428): socket ligt plat. Transient, wel retry.
+ */
+export class WhatsAppSendError extends Error {
+  readonly statusCode: number | undefined;
+  readonly data: unknown;
+  readonly isPermanent: boolean;
+  readonly cause: unknown;
+
+  constructor(cause: any, recipientJid: string) {
+    const msg = cause?.message ?? String(cause);
+    super(`sendMessage failed for ${recipientJid}: ${msg}`);
+    this.name = "WhatsAppSendError";
+    this.cause = cause;
+    this.statusCode = cause?.output?.statusCode ?? cause?.data;
+    this.data = cause?.data;
+    // 406 = not-acceptable (stale LID device state — re-pair niet helpt).
+    // loggedOut / forbidden: account kant afgesloten.
+    const permanentMessages = [
+      "not-acceptable",
+      "forbidden",
+      "logged out",
+    ];
+    const m = String(msg).toLowerCase();
+    this.isPermanent =
+      cause?.data === 406 ||
+      permanentMessages.some((p) => m.includes(p));
+  }
+}
+
 export async function sendWhatsAppMessage(
   logger: P.Logger,
   sock: WhatsAppSocket | null,
   recipientJid: string,
   text: string
-): Promise<proto.WebMessageInfo | void> {
+): Promise<proto.WebMessageInfo> {
   if (!sock || !sock.user) {
-    logger.error(
-      "Cannot send message: WhatsApp socket not connected or initialized."
+    throw new WhatsAppSendError(
+      new Error("WhatsApp socket not connected or initialized"),
+      recipientJid
     );
-    return;
   }
   if (!recipientJid) {
-    logger.error("Cannot send message: Recipient JID is missing.");
-    return;
+    throw new WhatsAppSendError(new Error("Recipient JID missing"), recipientJid);
   }
   if (!text) {
-    logger.error("Cannot send message: Message text is empty.");
-    return;
+    throw new WhatsAppSendError(new Error("Message text empty"), recipientJid);
   }
 
+  logger.info(
+    `Sending message to ${recipientJid}: ${text.substring(0, 50)}...`
+  );
+  const normalizedJid = jidNormalizedUser(recipientJid);
   try {
-    logger.info(
-      `Sending message to ${recipientJid}: ${text.substring(0, 50)}...`
-    );
-    const normalizedJid = jidNormalizedUser(recipientJid);
     const result = await sock.sendMessage(normalizedJid, { text: text });
-    logger.info({ msgId: result?.key.id }, "Message sent successfully");
+    if (!result) {
+      throw new WhatsAppSendError(
+        new Error("sendMessage returned undefined result"),
+        recipientJid
+      );
+    }
+    logger.info({ msgId: result.key.id }, "Message sent successfully");
     return result;
   } catch (error) {
+    // Log altijd de FULL error inclusief data/statusCode zodat de queue en
+    // audit-logs de root cause bewaren (voorheen werd dit stilzwijgend
+    // opgegeten waardoor error_message in de DB leeg bleef).
     logger.error({ err: error, recipientJid }, "Failed to send message");
-    return;
+    if (error instanceof WhatsAppSendError) throw error;
+    throw new WhatsAppSendError(error, recipientJid);
   }
 }
