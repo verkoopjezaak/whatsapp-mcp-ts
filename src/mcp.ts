@@ -17,6 +17,7 @@ import {
   searchMessages,
   updateMessageContent,
   enqueueOutgoingMessage,
+  getOutgoingMessageById,
 } from "./database.ts";
 
 import { sendWhatsAppMessage, AUDIO_DIR, IMAGE_DIR, type WhatsAppSocket } from "./whatsapp.ts";
@@ -408,8 +409,14 @@ export async function startMcpServer(
           "Recipient JID (user or group, e.g., '12345@s.whatsapp.net' or 'group123@g.us')",
         ),
       message: z.string().min(1).describe("The text message to send"),
+      wait_for_delivery: z
+        .boolean()
+        .optional()
+        .describe(
+          "If true, poll the queue up to ~20s and return the final status (sent/failed/pending). Default: true in queue mode so agents get a reliable confirmation.",
+        ),
     },
-    async ({ recipient, message }) => {
+    async ({ recipient, message, wait_for_delivery }) => {
       mcpLogger.info(`[MCP Tool] Executing send_message to ${recipient}`);
 
       let normalizedRecipient: string;
@@ -435,10 +442,12 @@ export async function startMcpServer(
 
       // USE_QUEUE=1: persist in outgoing_messages queue zodat de daemon het
       // asynchroon verstuurt. Nodig voor split architectuur waarbij MCP-server
-      // geen directe socket heeft.
+      // geen directe socket heeft. Default: wacht op aflevering zodat de
+      // caller een betrouwbare bevestiging krijgt.
       if (process.env.USE_QUEUE === "1") {
+        let queueId: number;
         try {
-          const queueId = enqueueOutgoingMessage({
+          queueId = enqueueOutgoingMessage({
             recipient_jid: normalizedRecipient,
             content: message,
             queued_by: "mcp-server",
@@ -446,14 +455,6 @@ export async function startMcpServer(
           mcpLogger.info(
             `[MCP Tool] send_message queued (id=${queueId}) for ${normalizedRecipient}`,
           );
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Message queued for delivery to ${normalizedRecipient} (queue id: ${queueId}). Daemon will deliver asynchronously.`,
-              },
-            ],
-          };
         } catch (error: any) {
           mcpLogger.error(
             `[MCP Tool Error] send_message queue write failed: ${error.message}`,
@@ -468,6 +469,77 @@ export async function startMcpServer(
             ],
           };
         }
+
+        const shouldWait = wait_for_delivery !== false; // default true
+        if (!shouldWait) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Message queued for delivery to ${normalizedRecipient} (queue id: ${queueId}). Daemon will deliver asynchronously.`,
+              },
+            ],
+          };
+        }
+
+        // Poll the queue for a final status. Max ~20s wachten: Baileys kan
+        // meerdere retries met backoff doen, dus we geven de processor tijd.
+        const pollStart = Date.now();
+        const POLL_TIMEOUT_MS = 20_000;
+        const POLL_INTERVAL_MS = 500;
+        let finalRow = getOutgoingMessageById(queueId);
+        while (
+          finalRow &&
+          (finalRow.status === "pending" || finalRow.status === "sending") &&
+          Date.now() - pollStart < POLL_TIMEOUT_MS
+        ) {
+          await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+          finalRow = getOutgoingMessageById(queueId);
+        }
+
+        if (!finalRow) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text",
+                text: `Message enqueued (id=${queueId}) but queue row disappeared. Investigate database.`,
+              },
+            ],
+          };
+        }
+
+        if (finalRow.status === "sent") {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Message delivered to ${normalizedRecipient} (queue id: ${queueId}, wa id: ${finalRow.whatsapp_message_id ?? "unknown"}).`,
+              },
+            ],
+          };
+        }
+        if (finalRow.status === "failed") {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text",
+                text: `Message FAILED to deliver to ${normalizedRecipient} (queue id: ${queueId}). Reason: ${finalRow.error_message ?? "unknown"}. Check WhatsApp connection or verify recipient JID. Use get_send_status to re-check.`,
+              },
+            ],
+          };
+        }
+        // Still pending/sending after timeout: socket likely down.
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: `Message still pending after ${POLL_TIMEOUT_MS / 1000}s (queue id: ${queueId}, status: ${finalRow.status}). Daemon may be disconnected. The processor will retry automatically when the connection is restored. Use get_send_status to verify later.`,
+            },
+          ],
+        };
       }
 
       if (!sock) {
@@ -971,6 +1043,75 @@ export async function startMcpServer(
             {
               type: "text",
               text: `Error reading PDFs in chat ${chat_jid}: ${error.message}`,
+            },
+          ],
+        };
+      }
+    },
+  );
+
+  server.tool(
+    "get_send_status",
+    {
+      queue_id: z
+        .number()
+        .int()
+        .positive()
+        .describe(
+          "The queue id returned by send_message. Use this to verify whether a message was actually delivered.",
+        ),
+    },
+    async ({ queue_id }) => {
+      mcpLogger.info(`[MCP Tool] Executing get_send_status for id=${queue_id}`);
+      try {
+        const row = getOutgoingMessageById(queue_id);
+        if (!row) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text",
+                text: `No outgoing message found with queue id ${queue_id}.`,
+              },
+            ],
+          };
+        }
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  queue_id: row.id,
+                  recipient: row.recipient_jid,
+                  status: row.status,
+                  attempts: row.attempts ?? 0,
+                  queued_at: row.queued_at,
+                  sent_at: row.sent_at,
+                  whatsapp_message_id: row.whatsapp_message_id ?? null,
+                  error_message: row.error_message ?? null,
+                  delivered: row.status === "sent",
+                  content_preview:
+                    row.content.length > 80
+                      ? row.content.substring(0, 80) + "..."
+                      : row.content,
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      } catch (error: any) {
+        mcpLogger.error(
+          `[MCP Tool Error] get_send_status failed for id=${queue_id}: ${error.message}`,
+        );
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: `Error reading send status: ${error.message}`,
             },
           ],
         };

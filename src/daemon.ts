@@ -77,6 +77,30 @@ async function runStandalone() {
 
   daemonLogger.info("Starting WhatsApp daemon (standalone mode)...");
 
+  // Crash-preventie: Baileys emit async errors (bijv. Timed Out tijdens
+  // groupMetadata) die niet aan een awaited promise gekoppeld zijn. In Node
+  // 22 killt dat het process. We loggen ze en houden de daemon in leven.
+  // De queue-processor merkt socket-failures zelf via sendMessage retries.
+  process.on("unhandledRejection", (reason: any) => {
+    const message = reason?.message ?? String(reason);
+    const statusCode = reason?.output?.statusCode;
+    daemonLogger.error(
+      {
+        err: reason,
+        statusCode,
+        isBaileysTimeout: statusCode === 408,
+      },
+      `[daemon] unhandledRejection caught (kept alive): ${message}`,
+    );
+  });
+
+  process.on("uncaughtException", (error: any) => {
+    daemonLogger.error(
+      { err: error },
+      `[daemon] uncaughtException caught (kept alive): ${error?.message ?? error}`,
+    );
+  });
+
   try {
     await startDaemon({ waLogger, daemonLogger });
     daemonLogger.info("Daemon running. Awaiting WhatsApp events...");

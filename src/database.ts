@@ -107,6 +107,23 @@ export function initializeDatabase(): DatabaseSync {
     `CREATE INDEX IF NOT EXISTS idx_outgoing_status ON outgoing_messages (status, queued_at);`,
   );
 
+  // Schema migration: add attempts + whatsapp_message_id columns if missing.
+  // Nodig voor verbeterde retry-strategie en list_messages-verificatie.
+  const outgoingCols = db
+    .prepare("PRAGMA table_info(outgoing_messages)")
+    .all() as Array<{ name: string }>;
+  const outgoingColNames = new Set(outgoingCols.map((c) => c.name));
+  if (!outgoingColNames.has("attempts")) {
+    db.exec(
+      `ALTER TABLE outgoing_messages ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0`,
+    );
+  }
+  if (!outgoingColNames.has("whatsapp_message_id")) {
+    db.exec(
+      `ALTER TABLE outgoing_messages ADD COLUMN whatsapp_message_id TEXT`,
+    );
+  }
+
   return db;
 }
 
@@ -120,6 +137,8 @@ export interface OutgoingMessage {
   queued_at: string;
   sent_at: string | null;
   queued_by: string | null;
+  attempts?: number;
+  whatsapp_message_id?: string | null;
 }
 
 export function enqueueOutgoingMessage(params: {
@@ -161,18 +180,60 @@ export function claimPendingOutgoingMessages(limit: number = 10): OutgoingMessag
   return rows as OutgoingMessage[];
 }
 
-export function markOutgoingSent(id: number): void {
+export function markOutgoingSent(
+  id: number,
+  whatsappMessageId?: string | null,
+): void {
   const db = getDb();
   db.prepare(
-    `UPDATE outgoing_messages SET status = 'sent', sent_at = ? WHERE id = ?`,
-  ).run(new Date().toISOString(), id);
+    `UPDATE outgoing_messages
+     SET status = 'sent', sent_at = ?, whatsapp_message_id = ?,
+         attempts = attempts + 1
+     WHERE id = ?`,
+  ).run(new Date().toISOString(), whatsappMessageId ?? null, id);
 }
 
 export function markOutgoingFailed(id: number, errorMessage: string): void {
   const db = getDb();
   db.prepare(
-    `UPDATE outgoing_messages SET status = 'failed', error_message = ? WHERE id = ?`,
+    `UPDATE outgoing_messages
+     SET status = 'failed', error_message = ?
+     WHERE id = ?`,
   ).run(errorMessage, id);
+}
+
+/**
+ * Zet een rij die we niet konden afleveren terug naar 'pending' zodat de
+ * processor het later (na reconnect) opnieuw probeert zonder een attempt
+ * te verbruiken. Gebruikt voor transient socket errors.
+ */
+export function releaseOutgoingToPending(id: number): void {
+  const db = getDb();
+  db.prepare(
+    `UPDATE outgoing_messages SET status = 'pending' WHERE id = ?`,
+  ).run(id);
+}
+
+export function incrementOutgoingAttempt(id: number): void {
+  const db = getDb();
+  db.prepare(
+    `UPDATE outgoing_messages SET attempts = attempts + 1 WHERE id = ?`,
+  ).run(id);
+}
+
+export function getOutgoingMessageById(
+  id: number,
+): OutgoingMessage | null {
+  const db = getDb();
+  const row = db
+    .prepare(
+      `SELECT id, recipient_jid, content, reply_to_message_id, status,
+              error_message, queued_at, sent_at, queued_by, attempts,
+              whatsapp_message_id
+         FROM outgoing_messages WHERE id = ?`,
+    )
+    .get(id) as OutgoingMessage | undefined;
+  return row ?? null;
 }
 
 export function storeChat(chat: Partial<Chat> & { jid: string }): void {
